@@ -19,7 +19,7 @@ import urllib.request
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, GLib, Gdk  # noqa: E402
+from gi.repository import Gtk, GLib, Gdk, Pango  # noqa: E402
 
 from . import config  # noqa: E402
 
@@ -33,7 +33,27 @@ CSS = b"""
   padding: 3px 14px;
 }
 .sysmon-row { font-family: monospace; font-size: 12px; color: #cdd2e0; }
+
+/* Expandable "heaviest tasks" panel (sits above the bar, grows upward). */
+.sysmon-panel { background-color: rgba(14, 16, 22, 0.95); }
+.sysmon-hdr, .sysmon-cell, .sysmon-dim { font-family: monospace; font-size: 11px; }
+.sysmon-hdr  { color: #7f8aa3; }
+.sysmon-cell { color: #cdd2e0; }
+.sysmon-dim  { color: #7f8aa3; }
+.sysmon-childrow { background-color: rgba(255, 255, 255, 0.02); }
+button.sysmon-flat {
+  background: none; border: none; box-shadow: none;
+  padding: 0 12px; min-height: 22px;
+}
+button.sysmon-flat:hover { background-color: rgba(255, 255, 255, 0.06); }
+.sysmon-toggle { font-family: monospace; font-size: 11px; color: #8b93a7; }
 """
+
+# Panel row heights (px). Kept in sync with the CSS min-heights so the window
+# geometry we push to X11 matches what GTK actually lays out.
+HDR_H, ROW_H, CHILD_H, PANEL_PAD = 20, 22, 18, 8
+# Minimum gap kept on each side of the centered panel content (px).
+PANEL_SIDE_MIN = 40
 
 
 # --------------------------------------------------------------------------- #
@@ -165,10 +185,35 @@ class SysmonBar(Gtk.ApplicationWindow):
         self._xid = None
         self._geo = self._monitor_geometry()
 
-        # Full-width translucent bar, with the text centered within it.
+        # Expandable-panel state.
+        self._panel_open = False
+        self._expanded: set[str] = set()   # app names currently drilled-down
+        self._apps: list[dict] = []
+        self._apps_sig = None
+        self._panel_px = 0
+
+        # Vertical stack: scrollable task panel on top (grows upward, hidden
+        # until toggled), the metrics bar row on the bottom.
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_child(outer)
+
+        # Full-width panel (dark strip) with a centered fixed-width column of
+        # rows inside it, so the first column clears a left/right dock rather
+        # than hiding under it.
+        self._panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._panel.add_css_class("sysmon-panel")
+        self._rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._rows.set_halign(Gtk.Align.CENTER)
+        self._panel.append(self._rows)
+        self._scroller = Gtk.ScrolledWindow()
+        self._scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._scroller.set_child(self._panel)
+        self._scroller.set_visible(False)
+        outer.append(self._scroller)
+
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         box.add_css_class("sysmon-bar")
-        self.set_child(box)
+        outer.append(box)
 
         self._bar = Gtk.Label()
         self._bar.add_css_class("sysmon-row")
@@ -176,6 +221,14 @@ class SysmonBar(Gtk.ApplicationWindow):
         self._bar.set_hexpand(True)
         self._bar.set_halign(Gtk.Align.CENTER)
         box.append(self._bar)
+
+        # Caret at the right edge toggles the panel.
+        self._toggle = Gtk.Button(label="▴ tasks")
+        self._toggle.set_has_frame(False)
+        self._toggle.add_css_class("sysmon-flat")
+        self._toggle.add_css_class("sysmon-toggle")
+        self._toggle.connect("clicked", self._on_toggle_panel)
+        box.append(self._toggle)
 
         if self._geo:
             self.set_default_size(self._geo["w"], config.BAR_HEIGHT)
@@ -193,13 +246,29 @@ class SysmonBar(Gtk.ApplicationWindow):
         except Exception:
             return None
 
+    def _current_height(self):
+        """Window height: just the bar when collapsed, bar + panel when open."""
+        return config.BAR_HEIGHT + (self._panel_px if self._panel_open else 0)
+
     def _target_geometry(self):
-        """Bottom-of-monitor slot for the bar. Recomputed live so a resolution
-        or monitor change is picked up on the next tick rather than staying
-        anchored to a stale size."""
+        """Bottom-anchored slot sized to the current (collapsed/expanded) height.
+        Recomputed live so a resolution/monitor change — or the panel opening —
+        is reflected on the next tick rather than staying anchored to a stale
+        size. Anchored to the bottom edge, so the panel grows upward."""
         g = self._monitor_geometry() or self._geo or {"x": 0, "y": 0, "w": 1920, "h": 1080}
         self._geo = g
-        return g["x"], g["y"] + g["h"] - config.BAR_HEIGHT, g["w"], config.BAR_HEIGHT
+        h = self._current_height()
+        return g["x"], g["y"] + g["h"] - h, g["w"], h
+
+    def _apply_geometry(self):
+        """Push the current target geometry to the window now (after a panel
+        open/close or drill-down changes the height) and keep it pinned above."""
+        if not self._xid:
+            return
+        x, y, w, h = self._target_geometry()
+        self.set_default_size(w, h)
+        self._x11.configure(self._xid, x, y, w, h)
+        self._x11.reassert_above(self._xid)
 
     def _on_realize(self, *_):
         try:
@@ -242,6 +311,129 @@ class SysmonBar(Gtk.ApplicationWindow):
     @staticmethod
     def _lbl(text):
         return f"<span foreground='#7f8aa3'>{text}</span>"
+
+    # -- heaviest-tasks panel ---------------------------------------------- #
+    @staticmethod
+    def _fmt_pct(v):
+        return f"{v:.1f}%" if v else "0%"
+
+    @staticmethod
+    def _fmt_mb(v):
+        if not v:
+            return "—"
+        return f"{v / 1024:.1f} GB" if v >= 1024 else f"{int(v)} MB"
+
+    @staticmethod
+    def _cell(text, width=None, xalign=0.0, cls="sysmon-cell",
+              expand=False, ellipsize=False):
+        lbl = Gtk.Label(label=str(text))
+        lbl.add_css_class(cls)
+        lbl.set_xalign(float(xalign))
+        if width:
+            lbl.set_width_chars(width)
+        if expand:
+            lbl.set_hexpand(True)
+        if ellipsize:
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        return lbl
+
+    def _row_cells(self, caret, name, cpu, ram, gpu, cls):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.append(self._cell(caret, 2, 0.0, cls))
+        row.append(self._cell(name, None, 0.0, cls, expand=True, ellipsize=True))
+        row.append(self._cell(cpu, 6, 1.0, cls))
+        row.append(self._cell(ram, 8, 1.0, cls))
+        row.append(self._cell(gpu, 9, 1.0, cls))
+        return row
+
+    def _render_panel(self):
+        # Rebuild from scratch each time — cheap for a handful of rows, and it
+        # keeps expand/collapse and live number updates on one code path.
+        child = self._rows.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self._rows.remove(child)
+            child = nxt
+        if not self._panel_open:
+            self._panel_px = 0
+            return
+
+        # Centered column width: the configured width, capped so it never runs
+        # under the screen edges.
+        mon_w = (self._geo or {"w": 1920}).get("w", 1920)
+        self._rows.set_size_request(
+            max(320, min(config.PANEL_WIDTH, mon_w - 2 * PANEL_SIDE_MIN)), -1)
+
+        self._rows.append(self._row_cells(
+            "", "application", "cpu", "ram", "vram", "sysmon-hdr"))
+        px = HDR_H
+        for a in self._apps:
+            expanded = a["app"] in self._expanded
+            caret = "▾" if expanded else ("▸" if a["count"] > 1 else " ")
+            name = f"{a['app']}  ({a['count']})" if a["count"] > 1 else a["app"]
+            btn = Gtk.Button()
+            btn.set_has_frame(False)
+            btn.add_css_class("sysmon-flat")
+            btn.set_child(self._row_cells(
+                caret, name, self._fmt_pct(a["cpu_pct"]),
+                self._fmt_mb(a["ram_mb"]), self._fmt_mb(a["gpu_mb"]), "sysmon-cell"))
+            btn.connect("clicked", self._on_toggle_app, a["app"], a["count"])
+            self._rows.append(btn)
+            px += ROW_H
+            if expanded:
+                for p in a["pids"]:
+                    r = self._row_cells(
+                        "", f"↳ {p['name']} · {p['pid']}", self._fmt_pct(p["cpu_pct"]),
+                        self._fmt_mb(p["ram_mb"]), self._fmt_mb(p["gpu_mb"]), "sysmon-dim")
+                    r.add_css_class("sysmon-childrow")
+                    self._rows.append(r)
+                    px += CHILD_H
+
+        # Cap the panel at 60% of the monitor and let it scroll past that.
+        max_px = int((self._geo or {"h": 1080})["h"] * 0.6)
+        self._panel_px = min(px + PANEL_PAD, max_px)
+        # Pin the scroller to an exact height. Neutralise min to 0 first so the
+        # (min <= max) invariant holds whether the panel grew or shrank vs the
+        # previous render.
+        self._scroller.set_min_content_height(0)
+        self._scroller.set_max_content_height(self._panel_px)
+        self._scroller.set_min_content_height(self._panel_px)
+
+    def _fetch_apps(self):
+        try:
+            self._apps = _fetch("/metrics/apps").get("apps", [])
+        except Exception:
+            self._apps = []
+
+    def _on_toggle_panel(self, _btn):
+        self._panel_open = not self._panel_open
+        self._scroller.set_visible(self._panel_open)
+        self._toggle.set_label("▾ tasks" if self._panel_open else "▴ tasks")
+        if self._panel_open and not self._apps:
+            self._fetch_apps()
+        self._render_panel()
+        self._apply_geometry()
+
+    def _on_toggle_app(self, _btn, app, count):
+        if count <= 1:
+            return
+        self._expanded.discard(app) if app in self._expanded else self._expanded.add(app)
+        self._render_panel()
+        self._apply_geometry()
+
+    def _update_panel(self):
+        """Refresh panel numbers on the tick while it's open; only re-render (and
+        re-lay-out the window) when the data actually changed, to avoid churn."""
+        if not self._panel_open:
+            return
+        self._fetch_apps()
+        sig = tuple((a["app"], a["count"], a["cpu_pct"], a["ram_mb"], a["gpu_mb"])
+                    for a in self._apps)
+        if sig != self._apps_sig:
+            self._apps_sig = sig
+            self._expanded &= {a["app"] for a in self._apps}  # drop vanished apps
+            self._render_panel()
+            self._apply_geometry()
 
     def refresh(self):
         # Self-heal the dock/pin first: if the WM reset us (lock/unlock, remap,
@@ -306,6 +498,7 @@ class SysmonBar(Gtk.ApplicationWindow):
         sections.append(self._lbl(m.get("host", {}).get("hostname", "")))
 
         self._bar.set_markup(SEP.join(sections))
+        self._update_panel()
         return True
 
 

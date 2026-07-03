@@ -87,7 +87,7 @@ class Collector:
         self._last_rapl: dict[str, tuple[int, float]] = {}
 
         # Cached top-processes (refreshed on the slower PROC_INTERVAL cadence).
-        self._procs_cache: dict = {"by_cpu": [], "by_ram": [], "by_gpu": []}
+        self._procs_cache: dict = {"by_cpu": [], "by_ram": [], "by_gpu": [], "apps": []}
         self._procs_last = 0.0
 
         # Self-health bookkeeping.
@@ -353,7 +353,8 @@ class Collector:
         disk["nvme_c"] = temps["nvme_c"]
         # Heaviest part of the tick — refresh slowly and reuse the cache between.
         if now - self._procs_last >= config.PROC_INTERVAL:
-            self._procs_cache = read_top(config.TOP_N)
+            self._procs_cache = read_top(
+                config.TOP_N, config.APPS_N, config.APPS_CHILDREN)
             self._procs_last = now
         procs = self._procs_cache
         smart = self.smart.read(now) if self.smart else []

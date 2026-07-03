@@ -37,6 +37,15 @@ SMART_INTERVAL = float(os.environ.get("SYSMON_SMART_INTERVAL", "60"))
 # Top-N processes to report per dimension (cpu / ram / gpu).
 TOP_N = int(os.environ.get("SYSMON_TOP_N", "5"))
 
+# Heaviest-applications view (widget's expandable panel): how many app groups to
+# report, and how many child PIDs to keep per app for the drill-down.
+APPS_N = int(os.environ.get("SYSMON_APPS_N", "8"))
+APPS_CHILDREN = int(os.environ.get("SYSMON_APPS_CHILDREN", "12"))
+# The task panel spans the full-width bar, but its content is centered in a
+# column this wide (px) so the first column clears a left/right dock instead of
+# hiding behind it. Capped to the monitor width; tune to taste.
+PANEL_WIDTH = int(os.environ.get("SYSMON_PANEL_WIDTH", "1000"))
+
 # The top-processes scan is the heaviest part of a tick (an extra nvidia-smi
 # spawn + a full process walk), so refresh it on a slower cadence than the core
 # temps/power metrics and cache in between. Bump this to lean out further.

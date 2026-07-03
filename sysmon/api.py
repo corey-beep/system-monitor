@@ -73,6 +73,14 @@ def processes(authorization: str | None = Header(default=None)):
     return collector.snapshot().get("processes", {})
 
 
+@app.get("/metrics/apps")
+def apps(authorization: str | None = Header(default=None)):
+    """Heaviest applications: PIDs grouped by app name with summed cpu/ram/vram
+    and their child PIDs. Powers the widget's expandable task panel."""
+    _auth(authorization)
+    return {"apps": collector.snapshot().get("processes", {}).get("apps", [])}
+
+
 @app.get("/metrics/fans")
 def fans(authorization: str | None = Header(default=None)):
     _auth(authorization)
