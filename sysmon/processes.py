@@ -1,9 +1,25 @@
 """Top processes by CPU, RAM and GPU memory — the 'what's hammering my PC?' data."""
 from __future__ import annotations
 
+import os
 import subprocess
 
 import psutil
+
+
+def _app_of(info: dict) -> str:
+    """Application label for grouping: the executable's basename, falling back to
+    the process name. Using the exe (not the mutable `comm`/name) merges apps
+    that rename their children — e.g. Firefox's content processes report a comm
+    of 'Isolated Web Content' but all run the same `firefox` binary."""
+    exe = info.get("exe")
+    if exe:
+        base = os.path.basename(exe)
+        # Ignore version-named binaries (e.g. an AppImage exe literally named
+        # '2.1.199') — those group nicer under their process name.
+        if base and any(c.isalpha() for c in base):
+            return base
+    return info.get("name") or "?"
 
 # Prime per-process CPU counters so the first real read isn't all zeros.
 _primed = False
@@ -50,7 +66,7 @@ def _group_apps(rows: list[dict], n: int, max_children: int) -> list[dict]:
     idle apps (browsers) still surface when everything's near 0% CPU."""
     groups: dict[str, dict] = {}
     for r in rows:
-        name = r["name"] or "?"
+        name = r["app"]
         g = groups.get(name)
         if g is None:
             g = groups[name] = {
@@ -87,7 +103,7 @@ def read_top(n: int = 5, apps_n: int = 8, apps_children: int = 12) -> dict:
     ncpu = psutil.cpu_count(logical=True) or 1
     gpu_mem = _gpu_procs()
     rows = []
-    for p in psutil.process_iter(["pid", "name", "memory_info"]):
+    for p in psutil.process_iter(["pid", "name", "exe", "memory_info"]):
         try:
             cpu = p.cpu_percent(None) / ncpu  # normalize to whole-machine %
             mi = p.info["memory_info"]
@@ -95,6 +111,7 @@ def read_top(n: int = 5, apps_n: int = 8, apps_children: int = 12) -> dict:
             rows.append({
                 "pid": pid,
                 "name": p.info["name"],
+                "app": _app_of(p.info),
                 "cpu_pct": round(cpu, 1),
                 "ram_mb": round(mi.rss / 1e6, 1) if mi else None,
                 "gpu_mb": gpu_mem.get(pid),
