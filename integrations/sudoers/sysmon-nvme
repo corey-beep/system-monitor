@@ -1,0 +1,4 @@
+# Allow the sysmon daemon (running as @USER@) to read NVMe SMART without a
+# password. smart-log is read-only. Installed to /etc/sudoers.d/sysmon-nvme
+# (must be mode 0440, root-owned). install.sh fills in @USER@.
+@USER@ ALL=(root) NOPASSWD: /usr/sbin/nvme smart-log /dev/nvme* -o json

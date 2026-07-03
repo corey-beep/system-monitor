@@ -1,0 +1,5 @@
+# Make Intel-RAPL / AMD powercap energy counters readable without root so the
+# sysmon collector can compute CPU package/core power. By default energy_uj is
+# 0400 root (CVE-2020-8694 side-channel mitigation). World-read is fine on a
+# single-user desktop; remove this file to revert (CPU power then reports null).
+SUBSYSTEM=="powercap", ACTION=="add", RUN+="/bin/chmod -R a+r /sys/devices/virtual/powercap"

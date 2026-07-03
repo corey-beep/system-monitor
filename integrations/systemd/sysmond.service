@@ -1,0 +1,17 @@
+[Unit]
+Description=sysmon metrics daemon (PC stats JSON API)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=@DIR@
+# Self-heal the venv if an OS Python bump orphaned its site-packages (see
+# venv-guard.sh). Rebuilding pip deps can take a bit, so widen the start timeout.
+ExecStartPre=@DIR@/integrations/systemd/venv-guard.sh @DIR@
+ExecStart=@DIR@/.venv/bin/python -m sysmon
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

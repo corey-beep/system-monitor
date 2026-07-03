@@ -1,0 +1,9 @@
+# pip-only dependencies. psutil and PyGObject (gi) come from the system —
+# the venv is created with --system-site-packages so they're visible.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+mcp>=1.2
+python-xlib>=0.33
+# Optional: only needed if you run the standalone Telegram bot.
+python-telegram-bot>=21.0

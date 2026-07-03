@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=sysmon widget
+Comment=Translucent desktop PC-stats widget
+Exec=sh -c 'cd @DIR@ && @DIR@/integrations/systemd/venv-guard.sh @DIR@ && exec env GDK_BACKEND=x11 .venv/bin/python -m sysmon.widget'
+Path=@DIR@
+Icon=utilities-system-monitor
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5

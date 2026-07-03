@@ -1,0 +1,11 @@
+# Python virtualenv (rebuilt by install.sh / venv-guard.sh)
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime lock created by venv-guard.sh
+.venv-guard.lock
+
+# Local secrets — real ones live in ~/.config/sysmon/secrets.json, never here
+secrets.json
+.env
