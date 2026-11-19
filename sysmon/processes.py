@@ -6,6 +6,8 @@ import subprocess
 
 import psutil
 
+from . import nvml
+
 
 def _app_of(info: dict) -> str:
     """Application label for grouping: the executable's basename, falling back to
@@ -36,7 +38,10 @@ def _prime():
 
 
 def _gpu_procs() -> dict[int, float]:
-    """pid -> GPU memory MiB, via nvidia-smi compute-apps."""
+    """pid -> GPU memory MiB: NVML in-process, else nvidia-smi compute-apps."""
+    via_nvml = nvml.gpu_procs()
+    if via_nvml is not None:
+        return via_nvml
     try:
         res = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,used_memory",

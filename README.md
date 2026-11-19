@@ -3,7 +3,9 @@
 A desktop PC-stats widget **and** an agent-queryable metrics service for Linux.
 
 One collector samples every sensor on the box and serves it as JSON on
-`localhost`. A translucent bar docked at the bottom of the screen displays it,
+`localhost`. A translucent bar docked at the bottom of the screen displays it
+(click **expand** for CPU / GPU / memory cards with meters, 6-minute history
+charts and the heaviest apps),
 and your agents (Claude Code, Hermes via MCP; OpenClaw "buddy" via HTTP) read the
 same data — so "what's my GPU temp?" works over Telegram and in any agent.
 
@@ -12,10 +14,13 @@ Built and verified on: Ubuntu 25.10, GNOME/Wayland, Ryzen 7 5800XT, RTX 3080.
 ## What it reports
 
 - **CPU** — model, total + per-core utilization, frequency, load average,
-  temperature (k10temp Tctl + per-CCD), package power (RAPL)
+  temperature (k10temp Tctl + per-CCD), package power (RAPL), CPU pressure
+  (PSI), run queue / blocked tasks, context switches/s, governor + energy profile
 - **GPU** — temp, power draw vs limit, GPU/VRAM utilization, VRAM used/total,
-  core clock, fan % (NVIDIA via `nvidia-smi`)
-- **Memory / swap**, **disk** throughput + root usage + NVMe temp,
+  core / memory / video clocks vs max, encoder + decoder load, P-state, PCIe
+  link, fan %, driver version (NVIDIA via `nvidia-smi`)
+- **Memory / swap** — used, available, cache/buffers, shared, dirty, committed,
+  swap cache, memory + IO pressure (PSI); **disk** throughput + root usage + NVMe temp,
   **motherboard** temp, **power** (CPU + GPU watts), uptime/host info
 - `/metrics/history` keeps the last ~120 samples for trends
 
@@ -102,6 +107,10 @@ curl -s http://127.0.0.1:8787/metrics/power      | jq
 | `SYSMON_CPU_TEMP_WARN` / `_CRIT`, `SYSMON_GPU_TEMP_WARN` / `_CRIT` | 80/90, 80/87 | alert thresholds (°C) |
 | `SYSMON_INTERVAL` / `SYSMON_PROC_INTERVAL` | `3` / `15` | core sample seconds / slower top-process scan seconds |
 | `SYSMON_BAR_HEIGHT` / `SYSMON_BAR_MONITOR` / `SYSMON_BAR_RESERVE` | `30` / `0` / `0` | bar px height / which monitor / reserve screen space (1) |
+| `SYSMON_BAR_POSITION` / `SYSMON_BAR_TOP_OFFSET` | `bottom` / _(auto)_ | dock edge (`top` or `bottom`) / px to sit below GNOME's top bar (auto = workarea inset) |
+| `SYSMON_PANEL_WIDTH` | `1320` | width (px) of the centered expanded-panel content |
+| `SYSMON_BAR_FADE_DELAY` / `SYSMON_BAR_FADE_OPACITY` | `3.0` / `0.25` | seconds without hover before the bar dims (0 = never) / dimmed opacity |
+| `SYSMON_BAR_FADE_IN_MS` / `SYSMON_BAR_FADE_OUT_MS` | `400` / `900` | fade-in duration on hover / fade-out duration when idle |
 
 ### Fan RPMs (CoolerControl)
 
@@ -128,7 +137,7 @@ sudoers rule in `integrations/sudoers/` (both handled by `install.sh`).
 2. **The bar runs under XWayland.** GNOME/Wayland won't let a client dock itself
    or stay above other windows, so the bar forces `GDK_BACKEND=x11` and sets
    EWMH hints — `_NET_WM_WINDOW_TYPE_DOCK`, above + sticky + skip-taskbar, sized
-   to span the bottom of the monitor (and `_NET_WM_STRUT` to reserve space when
+   to span the top (or bottom) of the monitor (and `_NET_WM_STRUT` to reserve space when
    `SYSMON_BAR_RESERVE=1`). If `python-xlib` is missing it still renders, just
    undocked. Tune with `SYSMON_BAR_HEIGHT` / `SYSMON_BAR_MONITOR`.
 

@@ -21,6 +21,11 @@ else
   echo "    skipped — CPU power will report null until installed"
 fi
 
+echo "==> Installing GTK cairo bridge (panel charts and meters)"
+if ! python3 -c "import gi; gi.require_foreign('cairo')" 2>/dev/null; then
+  sudo apt-get install -y python3-gi-cairo || echo "    couldn't install python3-gi-cairo — panel charts won't draw"
+fi
+
 echo "==> Installing NVMe SMART support (nvme-cli + scoped sudoers)"
 if ! command -v nvme >/dev/null; then
   sudo apt-get install -y nvme-cli || echo "    couldn't install nvme-cli — SMART will report needs_setup"

@@ -44,7 +44,7 @@ APPS_CHILDREN = int(os.environ.get("SYSMON_APPS_CHILDREN", "12"))
 # The task panel spans the full-width bar, but its content is centered in a
 # column this wide (px) so the first column clears a left/right dock instead of
 # hiding behind it. Capped to the monitor width; tune to taste.
-PANEL_WIDTH = int(os.environ.get("SYSMON_PANEL_WIDTH", "1000"))
+PANEL_WIDTH = int(os.environ.get("SYSMON_PANEL_WIDTH", "1320"))
 
 # The top-processes scan is the heaviest part of a tick (an extra nvidia-smi
 # spawn + a full process walk), so refresh it on a slower cadence than the core
@@ -54,9 +54,22 @@ PROC_INTERVAL = float(os.environ.get("SYSMON_PROC_INTERVAL", "15.0"))
 # Desktop bar geometry.
 BAR_HEIGHT = int(os.environ.get("SYSMON_BAR_HEIGHT", "30"))
 BAR_MONITOR = int(os.environ.get("SYSMON_BAR_MONITOR", "0"))  # which monitor
+# Which screen edge to dock to: "top" or "bottom".
+BAR_POSITION = "top" if os.environ.get("SYSMON_BAR_POSITION", "bottom").lower() == "top" else "bottom"
+# Px to push a top bar down so it clears GNOME's own top bar. Empty = auto
+# (read from the monitor workarea at startup).
+_top_off = os.environ.get("SYSMON_BAR_TOP_OFFSET", "").strip()
+BAR_TOP_OFFSET = int(_top_off) if _top_off else None
 # Reserve screen space (real panel) vs float over windows. Reserving is riskier
 # on multi-monitor GNOME, so default to an always-on-top overlay bar.
 BAR_RESERVE = os.environ.get("SYSMON_BAR_RESERVE", "0") == "1"
+# Dim the bar when the pointer isn't over it: fade to BAR_FADE_OPACITY after
+# BAR_FADE_DELAY seconds without hover; hovering fades it back in. Durations
+# are in ms. Set the delay to 0 to disable fading.
+BAR_FADE_DELAY = float(os.environ.get("SYSMON_BAR_FADE_DELAY", "3.0"))
+BAR_FADE_OPACITY = float(os.environ.get("SYSMON_BAR_FADE_OPACITY", "0.25"))
+BAR_FADE_IN_MS = int(os.environ.get("SYSMON_BAR_FADE_IN_MS", "400"))
+BAR_FADE_OUT_MS = int(os.environ.get("SYSMON_BAR_FADE_OUT_MS", "900"))
 
 # --- Alert thresholds (drive the status rollup) ------------------------------
 CPU_TEMP_WARN = float(os.environ.get("SYSMON_CPU_TEMP_WARN", "80"))

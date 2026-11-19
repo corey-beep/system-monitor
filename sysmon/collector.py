@@ -23,12 +23,21 @@ from collections import deque
 
 import psutil
 
-from . import config, health
+from . import config, health, nvml
 from .processes import read_top
 from .smart import SmartReader
 from .coolercontrol import CoolerControlClient
 
 RAPL_BASE = "/sys/class/powercap"
+HWMON_BASE = "/sys/class/hwmon"
+HWMON_REDISCOVER_S = 300
+# Sensors that are slow to read (each NVMe read is an admin command that wakes
+# the drive; the board WMI sensors go through ACPI) and change slowly, so they
+# are re-read on this cadence instead of every tick.
+SLOW_SENSOR_CHIPS = {"nvme", "gigabyte_wmi"}
+SLOW_SENSOR_S = 30
+# Keep scanning processes for this long after the last request for them.
+PROC_DEMAND_WINDOW = 60
 
 # nvidia-smi query fields, in order. We zip values back against these names so
 # the parser is robust to field additions/reordering.
@@ -41,6 +50,8 @@ GPU_FIELDS = [
     "clocks_throttle_reasons.hw_slowdown",
     "clocks_throttle_reasons.hw_thermal_slowdown",
     "clocks_throttle_reasons.sw_thermal_slowdown",
+    "utilization.encoder", "utilization.decoder", "clocks.max.graphics",
+    "clocks.max.memory", "clocks.video", "driver_version",
 ]
 # Concerning throttle reasons (gpu_idle is normal, handled separately).
 THROTTLE_LABELS = {
@@ -85,10 +96,18 @@ class Collector:
         self._last_disk_io = None
         self._last_disk_time = None
         self._last_rapl: dict[str, tuple[int, float]] = {}
+        self._last_ctxt: tuple[int, float] | None = None
+        self._hwmon: list | None = None
+        self._hwmon_at = 0.0
+        self._slow_temps: dict[str, dict] = {}
+        self._slow_temps_at = 0.0
+        self._gpu_backend: str | None = None
 
         # Cached top-processes (refreshed on the slower PROC_INTERVAL cadence).
         self._procs_cache: dict = {"by_cpu": [], "by_ram": [], "by_gpu": [], "apps": []}
         self._procs_last = 0.0
+        self._procs_demand = 0.0   # last time someone asked for processes
+        self._procs_lock = threading.Lock()
 
         # Self-health bookkeeping.
         self._start = time.time()
@@ -197,6 +216,12 @@ class Collector:
         return out
 
     def _read_gpu(self) -> list | None:
+        gpus = nvml.read_gpus()
+        if gpus:
+            self._sources["nvidia_smi"] = "ok"   # key kept for API compat
+            self._gpu_backend = "nvml"
+            return gpus
+        self._gpu_backend = "nvidia-smi"
         try:
             res = subprocess.run(
                 ["nvidia-smi", f"--query-gpu={','.join(GPU_FIELDS)}",
@@ -236,6 +261,12 @@ class Collector:
                 "clock_sm_mhz": _num(raw["clocks.sm"]),
                 "clock_mem_mhz": _num(raw["clocks.mem"]),
                 "fan_pct": _num(raw["fan.speed"]),
+                "clock_max_mhz": _num(raw["clocks.max.graphics"]),
+                "clock_mem_max_mhz": _num(raw["clocks.max.memory"]),
+                "clock_video_mhz": _num(raw["clocks.video"]),
+                "util_enc_pct": _num(raw["utilization.encoder"]),
+                "util_dec_pct": _num(raw["utilization.decoder"]),
+                "driver": raw["driver_version"],
                 "pstate": raw["pstate"],
                 "pcie": {
                     "gen_cur": _int(raw["pcie.link.gen.current"]),
@@ -249,29 +280,73 @@ class Collector:
         self._sources["nvidia_smi"] = "ok" if gpus else "error"
         return gpus or None
 
-    def _read_temps(self) -> dict:
+    @staticmethod
+    def _discover_hwmon() -> list:
+        """[(chip, label, path)] for every hwmon temp input. Discovery walks
+        sysfs (what psutil does on every call); readings then just re-read
+        these files."""
+        found = []
         try:
-            raw = psutil.sensors_temperatures()
-            self._sources["libsensors"] = "ok" if raw else "empty"
-        except Exception:
-            raw = {}
-            self._sources["libsensors"] = "error"
+            entries = sorted(os.listdir(HWMON_BASE))
+        except OSError:
+            return found
+        for entry in entries:
+            base = os.path.join(HWMON_BASE, entry)
+            try:
+                with open(os.path.join(base, "name")) as f:
+                    chip = f.read().strip()
+                files = sorted(os.listdir(base))
+            except OSError:
+                continue
+            for i, fn in enumerate(x for x in files
+                                   if x.startswith("temp") and x.endswith("_input")):
+                label = None
+                try:
+                    with open(os.path.join(base, fn.replace("_input", "_label"))) as f:
+                        label = f.read().strip()
+                except OSError:
+                    pass
+                found.append((chip, label or f"t{i}", os.path.join(base, fn)))
+        return found
+
+    def _read_temps(self) -> dict:
+        now = time.time()
+        if self._hwmon is None or now - self._hwmon_at > HWMON_REDISCOVER_S:
+            self._hwmon = self._discover_hwmon()
+            self._hwmon_at = now
+        chips: dict[str, dict] = {}
+        failed = False
+        slow_due = now - self._slow_temps_at >= SLOW_SENSOR_S
+        for chip, label, path in self._hwmon:
+            if chip in SLOW_SENSOR_CHIPS and not slow_due:
+                if label in self._slow_temps.get(chip, {}):
+                    chips.setdefault(chip, {})[label] = self._slow_temps[chip][label]
+                continue
+            try:
+                with open(path) as f:
+                    val = round(int(f.read().strip()) / 1000, 1)
+            except (OSError, ValueError):
+                failed = True
+                continue
+            chips.setdefault(chip, {})[label] = val
+        if slow_due:
+            self._slow_temps = {c: dict(v) for c, v in chips.items()
+                                if c in SLOW_SENSOR_CHIPS}
+            self._slow_temps_at = now
+        if failed:
+            self._hwmon = None   # a sensor vanished/renumbered: rediscover next tick
+        self._sources["libsensors"] = "ok" if chips else "empty"
 
         def first(chip, *labels):
-            for s in raw.get(chip, []):
-                if s.label in labels:
-                    return round(s.current, 1)
+            for label in labels:
+                if label in chips.get(chip, {}):
+                    return chips[chip][label]
             return None
 
         def chip_max(chip):
-            vals = [s.current for s in raw.get(chip, [])]
-            return round(max(vals), 1) if vals else None
+            vals = list(chips.get(chip, {}).values())
+            return max(vals) if vals else None
 
-        chips = {
-            chip: {(s.label or f"t{i}"): round(s.current, 1)
-                   for i, s in enumerate(sensors)}
-            for chip, sensors in raw.items()
-        }
         return {
             "cpu_c": first("k10temp", "Tctl"),
             "cpu_ccd_c": first("k10temp", "Tccd1"),
@@ -298,6 +373,74 @@ class Collector:
             out["root_total_gb"] = round(u.total / 1e9, 1)
             out["root_pct"] = u.percent
         except OSError:
+            pass
+        return out
+
+    @staticmethod
+    def _read_psi() -> dict:
+        """Pressure stall info: % of the last 10s that tasks were stalled
+        waiting on CPU / memory / IO ("some" = at least one task, "full" = all
+        non-idle tasks). Better "does it feel slow" signal than utilisation."""
+        out = {}
+        for res in ("cpu", "memory", "io"):
+            try:
+                with open(f"/proc/pressure/{res}") as f:
+                    for line in f:
+                        kind, *fields = line.split()
+                        vals = dict(x.split("=") for x in fields)
+                        out[f"{res}_{kind}"] = float(vals["avg10"])
+            except (OSError, ValueError, KeyError):
+                pass
+        return out
+
+    def _read_sched(self, now: float) -> dict:
+        """Run-queue depth, blocked tasks and context switches/s from /proc/stat."""
+        out = {"procs_running": None, "procs_blocked": None, "ctx_per_s": None}
+        ctxt = None
+        try:
+            with open("/proc/stat") as f:
+                for line in f:
+                    if line.startswith("ctxt "):
+                        ctxt = int(line.split()[1])
+                    elif line.startswith("procs_running "):
+                        out["procs_running"] = int(line.split()[1])
+                    elif line.startswith("procs_blocked "):
+                        out["procs_blocked"] = int(line.split()[1])
+        except (OSError, ValueError):
+            return out
+        if ctxt is not None and self._last_ctxt:
+            last, t = self._last_ctxt
+            if now > t:
+                out["ctx_per_s"] = int((ctxt - last) / (now - t))
+        if ctxt is not None:
+            self._last_ctxt = (ctxt, now)
+        return out
+
+    @staticmethod
+    def _read_cpufreq_policy() -> dict:
+        def rd(name):
+            try:
+                with open(f"/sys/devices/system/cpu/cpu0/cpufreq/{name}") as f:
+                    return f.read().strip()
+            except OSError:
+                return None
+        return {"governor": rd("scaling_governor"),
+                "epp": rd("energy_performance_preference"),
+                "driver": rd("scaling_driver")}
+
+    @staticmethod
+    def _read_meminfo() -> dict:
+        """Fields psutil doesn't expose (kB in /proc/meminfo → GB)."""
+        want = {"Dirty": "dirty_gb", "Committed_AS": "committed_gb",
+                "SwapCached": "swap_cached_gb", "Shmem": "shared_gb"}
+        out = {}
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    key, _, rest = line.partition(":")
+                    if key in want:
+                        out[want[key]] = round(int(rest.split()[0]) / 1e6, 2)
+        except (OSError, ValueError):
             pass
         return out
 
@@ -345,17 +488,19 @@ class Collector:
             load = [None, None, None]
         vm = psutil.virtual_memory()
         sm = psutil.swap_memory()
+        psi = self._read_psi()
+        sched = self._read_sched(now)
+        meminfo = self._read_meminfo()
 
         temps = self._read_temps()
         power = self._read_rapl_power(now)
         gpu = self._read_gpu()
         disk = self._read_disk(now)
         disk["nvme_c"] = temps["nvme_c"]
-        # Heaviest part of the tick — refresh slowly and reuse the cache between.
-        if now - self._procs_last >= config.PROC_INTERVAL:
-            self._procs_cache = read_top(
-                config.TOP_N, config.APPS_N, config.APPS_CHILDREN)
-            self._procs_last = now
+        # Heaviest part of the tick: refresh slowly, and only while someone
+        # (the open panel, an agent) has asked for process data recently.
+        if now - self._procs_demand <= PROC_DEMAND_WINDOW:
+            self._refresh_procs(now)
         procs = self._procs_cache
         smart = self.smart.read(now) if self.smart else []
         if self.smart:
@@ -392,6 +537,9 @@ class Collector:
                 "temp_c": temps["cpu_c"],
                 "ccd_temp_c": temps["cpu_ccd_c"],
                 "power_w": cpu_w,
+                "pressure_pct": psi.get("cpu_some"),
+                **sched,
+                **self._read_cpufreq_policy(),
             },
             "gpu": gpu,
             "memory": {
@@ -400,6 +548,13 @@ class Collector:
                 "pct": vm.percent,
                 "swap_used_gb": round(sm.used / 1e9, 1),
                 "swap_total_gb": round(sm.total / 1e9, 1),
+                "available_gb": round(vm.available / 1e9, 1),
+                "cached_gb": round((vm.cached + vm.buffers) / 1e9, 1),
+                "free_gb": round(vm.free / 1e9, 1),
+                **meminfo,
+                "pressure_pct": psi.get("memory_some"),
+                "pressure_full_pct": psi.get("memory_full"),
+                "io_pressure_pct": psi.get("io_some"),
             },
             "disk": disk,
             "power": {
@@ -420,6 +575,7 @@ class Collector:
                 "uptime_s": int(now - self._start),
                 "version": "1.1.0",
                 "interval_s": self.interval,
+                "gpu_backend": self._gpu_backend,
                 "samples": self._samples,
                 "consecutive_errors": self._consec_errors,
                 "last_error": self._last_error,
@@ -493,6 +649,24 @@ class Collector:
         if self._last_error:
             snap.setdefault("health", {})["last_error"] = self._last_error
         return snap
+
+    def _refresh_procs(self, now: float, max_age: float | None = None):
+        if max_age is None:
+            max_age = config.PROC_INTERVAL
+        with self._procs_lock:
+            if now - self._procs_last >= max_age:
+                self._procs_cache = read_top(
+                    config.TOP_N, config.APPS_N, config.APPS_CHILDREN)
+                self._procs_last = now
+
+    def processes(self) -> dict:
+        """Process data on demand: marks interest (so the collector keeps the
+        cache fresh for a while) and refreshes inline if it's stale, so the
+        first request after an idle spell doesn't get old numbers."""
+        now = time.time()
+        self._procs_demand = now
+        self._refresh_procs(now)
+        return self._procs_cache
 
     def history(self) -> list:
         with self._lock:
