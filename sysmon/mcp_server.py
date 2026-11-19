@@ -10,11 +10,11 @@ that talks to sensors (the daemon). Register with:
 """
 import httpx
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from . import config
 
-mcp = FastMCP("sysmon")
+mcp = MCPServer("sysmon")
 
 
 def _get(path: str) -> dict:
